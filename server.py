@@ -1,3 +1,4 @@
+# server.py — Demo mode: show ONLY red & yellow balls (no black/cue) with less-crowded labels
 import os
 from io import BytesIO
 
@@ -9,7 +10,6 @@ from PIL import Image, ImageOps
 import uvicorn
 
 # --- Render/containers friendliness ---
-# Avoid OpenMP / thread contention in shared environments
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
 try:
@@ -17,7 +17,6 @@ try:
 except Exception:
     pass
 
-# Allow overriding port/allowed origins via env (Render sets $PORT)
 PORT = int(os.getenv("PORT", "8000"))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
@@ -25,11 +24,11 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "pool-detect-server"}
+    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.0.1-redyellow-demo"}
 
 @app.get("/healthz")
 def health():
-    return {"status": "ok"}
+    return {"status": "healthy"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,20 +38,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- health/info routes for Render ----
-@app.get("/")
-def root():
-    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.0.0"}
-
-@app.get("/healthz")
-def health():
-    return {"status": "healthy"}
-
 # ---------- helpers ----------
-def pil_to_cv2(img_pil): 
+def pil_to_cv2(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 def dedupe(circles, thr=0.6):
+    """Merge near-duplicate circles (keeps larger first)."""
     if not circles:
         return []
     circles = sorted(circles, key=lambda c: c[2], reverse=True)
@@ -63,6 +54,7 @@ def dedupe(circles, thr=0.6):
     return kept
 
 def felt_mask_hsv(hsv):
+    """Find the cloth/felt region (tolerant of blue/green tables)."""
     h, w = hsv.shape[:2]
     cx1, cy1, cx2, cy2 = int(w * .4), int(h * .4), int(w * .6), int(h * .6)
     center = hsv[cy1:cy2, cx1:cx2]
@@ -73,7 +65,7 @@ def felt_mask_hsv(hsv):
         np.array([min(179, Hm + 18), 255, 255], np.uint8),
     )
     green = cv2.inRange(hsv, np.array([35, 60, 40]), np.array([85, 255, 255]))
-    blue = cv2.inRange(hsv, np.array([85, 40, 40]), np.array([130, 255, 255]))
+    blue  = cv2.inRange(hsv, np.array([85, 40, 40]), np.array([130, 255, 255]))
     mask = cv2.bitwise_or(dyn, cv2.bitwise_or(green, blue))
     mask = cv2.medianBlur(mask, 7)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), 2)
@@ -86,6 +78,7 @@ def felt_mask_hsv(hsv):
     return out
 
 def estimate_radius(mask, img_w):
+    """Approx ball radius in px based on table width."""
     if mask is not None and mask.any():
         xs = np.where(mask > 0)[1]
         if xs.size:
@@ -109,14 +102,11 @@ def run_hough(gray, mask, r_est, param2, blur_ksize=9, dp=1.2):
             out.append((int(x), int(y), int(r), None))
     return out
 
-COLOR_BINS = [
-    ("red",     [(0, 10), (170, 179)], 90, 80),
-    ("orange",  [(11, 25)],            90, 90),
-    ("yellow",  [(26, 40)],            90, 110),
-    ("green",   [(41, 85)],            60, 70),
-    ("blue",    [(86, 130)],           60, 70),
-    ("purple",  [(131, 160)],          60, 70),
-]
+# For reference (OpenCV HSV H: 0..179)
+COLOR_BINS = {
+    "red":    [(0, 10), (170, 179)],
+    "yellow": [(26, 40)],
+}
 
 def _circles_from_binary(bin_mask, label, r_est):
     out = []
@@ -136,61 +126,88 @@ def _circles_from_binary(bin_mask, label, r_est):
         out.append((x, y, r, label))
     return out
 
-def color_mask_passes(hsv, base_mask, r_est):
+def color_mask_passes_red_yellow(hsv, base_mask, r_est):
+    """Proposals from ONLY red & yellow segmentation (no black/cue here)."""
     cand = []
-    cue = cv2.inRange(hsv, np.array([0, 0, 210]), np.array([179, 55, 255]))
+    # yellow
+    ymask = np.zeros(hsv.shape[:2], np.uint8)
+    for lo, hi in COLOR_BINS["yellow"]:
+        ymask |= cv2.inRange(hsv, np.array([lo, 90, 110]), np.array([hi, 255, 255]))
     if base_mask is not None:
-        cue = cv2.bitwise_and(cue, base_mask)
-    cand += _circles_from_binary(cue, "cue", r_est)
+        ymask = cv2.bitwise_and(ymask, base_mask)
+    cand += _circles_from_binary(ymask, "yellow", r_est)
 
-    black = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([179, 255, 55]))
+    # red (wrap-around)
+    rmask = np.zeros(hsv.shape[:2], np.uint8)
+    for lo, hi in COLOR_BINS["red"]:
+        rmask |= cv2.inRange(hsv, np.array([lo, 90, 80]), np.array([hi, 255, 255]))
     if base_mask is not None:
-        black = cv2.bitwise_and(black, base_mask)
-    cand += _circles_from_binary(black, "black", r_est)
+        rmask = cv2.bitwise_and(rmask, base_mask)
+    cand += _circles_from_binary(rmask, "red", r_est)
 
-    for name, ranges, smin, vmin in COLOR_BINS:
-        cmask = np.zeros(hsv.shape[:2], np.uint8)
-        for lo, hi in ranges:
-            cmask |= cv2.inRange(hsv, np.array([lo, smin, vmin]), np.array([hi, 255, 255]))
-        if base_mask is not None:
-            cmask = cv2.bitwise_and(cmask, base_mask)
-        cand += _circles_from_binary(cmask, name, r_est)
     return cand
 
-def white_ratio(hsv_full, x, y, r):
+def classify_red_or_yellow(hsv_full, x, y, r):
+    """Dominant hue inside circle -> 'red' | 'yellow' | None."""
     mask = np.zeros(hsv_full.shape[:2], np.uint8)
-    cv2.circle(mask, (x, y), max(2, int(r * 0.9)), 255, -1)
-    white = cv2.inRange(hsv_full, np.array([0, 0, 205]), np.array([179, 70, 255]))
-    white = cv2.bitwise_and(white, mask)
-    total = cv2.countNonZero(mask)
-    return (cv2.countNonZero(white) / total) if total > 0 else 0.0
+    cv2.circle(mask, (x, y), max(2, int(r * 0.85)), 255, -1)
+    hs = hsv_full[..., 0][mask > 0]
+    ss = hsv_full[..., 1][mask > 0]
+    vs = hsv_full[..., 2][mask > 0]
+    if hs.size == 0:
+        return None
+    # Require reasonable saturation/brightness to avoid rails/floor
+    valid = (ss > 70) & (vs > 70)
+    if not np.any(valid):
+        return None
+    h = hs[valid]
+    # Map hue to bins
+    def in_range(angle, lo, hi):
+        if lo <= hi:
+            return (h >= lo) & (h <= hi)
+        # wrap-around
+        return (h >= lo) | (h <= hi)
 
-def cue_or_object(hsv_full, x, y, r):
-    lab = cv2.cvtColor(cv2.cvtColor(hsv_full, cv2.COLOR_HSV2BGR), cv2.COLOR_BGR2LAB)
-    mask = np.zeros(hsv_full.shape[:2], np.uint8)
-    cv2.circle(mask, (x, y), max(2, int(r * 0.8)), 255, -1)
-    L, a, b, _ = cv2.mean(lab, mask=mask)
-    wr = white_ratio(hsv_full, x, y, r)
-    if wr > 0.78 and (abs(a - 128) + abs(b - 128)) < 22:
-        return "cue"
-    return "object"
+    red_mask = in_range(h, 0, 10) | in_range(h, 170, 179)
+    yellow_mask = in_range(h, 26, 40)
 
-def solid_or_stripe(hsv_full, x, y, r):
-    wr = white_ratio(hsv_full, x, y, r)
-    if wr >= 0.42:
-        return "object (stripe)"
-    if wr <= 0.22:
-        return "object (solid)"
-    return "object (solid)"  # bias to solid
+    red_ratio = np.count_nonzero(red_mask) / h.size
+    yellow_ratio = np.count_nonzero(yellow_mask) / h.size
+
+    if max(red_ratio, yellow_ratio) < 0.15:
+        return None
+    return "red" if red_ratio >= yellow_ratio else "yellow"
+
+def suppress_crowding(circles, min_sep_factor=1.2):
+    """
+    Final pass to reduce crowded labels:
+    keep circles so that center-to-center >= min_sep_factor * min(r_i, r_j).
+    Prefer larger radius first.
+    """
+    if not circles:
+        return []
+    circles = sorted(circles, key=lambda c: c[2], reverse=True)
+    kept = []
+    for x, y, r, lbl in circles:
+        if not any(np.hypot(x - kx, y - ky) < min_sep_factor * min(r, kr) for kx, ky, kr, _ in kept):
+            kept.append((x, y, r, lbl))
+    return kept
 
 # ---------- endpoint ----------
 @app.post("/detect")
 async def detect_balls(file: UploadFile = File(...)):
+    """
+    DEMO behavior for client request:
+      - Identify ONLY red and yellow balls.
+      - Do NOT identify black (filtered out implicitly).
+      - Return fewer, well-spaced labels (less crowded).
+    """
     contents = await file.read()
     image_pil = ImageOps.exif_transpose(Image.open(BytesIO(contents))).convert("RGB")
     bgr_full = pil_to_cv2(image_pil)
     H0, W0 = bgr_full.shape[:2]
 
+    # downscale for speed; use original for final coords/colors
     MAX_DIM = 1100
     scale = 1.0
     if max(H0, W0) > MAX_DIM:
@@ -207,6 +224,7 @@ async def detect_balls(file: UploadFile = File(...)):
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     r_est = estimate_radius(mask_felt, bgr.shape[1])
 
+    # Hough multi-pass for geometric proposals (kept, but we will color-filter later)
     proposals = []
     for p2, blur, dp, use_mask in [
         (30, 9, 1.2, True),
@@ -216,22 +234,35 @@ async def detect_balls(file: UploadFile = File(...)):
     ]:
         proposals += run_hough(gray, mask_felt if use_mask else None, r_est, p2, blur, dp)
 
-    proposals += color_mask_passes(hsv, mask_felt, r_est)
+    # Add color-based proposals for red & yellow only
+    proposals += color_mask_passes_red_yellow(hsv, mask_felt, r_est)
+
+    # Merge duplicates
     merged = dedupe(proposals, thr=0.6)
 
+    # Final color decision on FULL-RES image; filter to only red/yellow
     hsv_full = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2HSV)
-    results = []
+    ry = []
     for x, y, r, lbl in merged:
+        # back to original coordinates
         if scale != 1.0:
             x, y, r = int(x / scale), int(y / scale), int(r / scale)
+        # ignore circles touching edges (rails/pockets)
         if x < r or y < r or x > (W0 - r) or y > (H0 - r):
             continue
-        base = cue_or_object(hsv_full, x, y, r) if lbl is None else ("cue" if lbl == "cue" else "object")
-        final_label = "cue" if base == "cue" else solid_or_stripe(hsv_full, x, y, r)
-        results.append({"x": x, "y": y, "r": r, "label": final_label})
+        # Resolve color: if proposal had a color label, keep it; else classify
+        color = lbl if lbl in ("red", "yellow") else classify_red_or_yellow(hsv_full, x, y, r)
+        if color not in ("red", "yellow"):
+            continue
+        ry.append((x, y, r, color))
 
-    return {"success": True, "detections": results, "w": W0, "h": H0}
+    # LESS-CROWDED: enforce bigger separation between final labels
+    ry = suppress_crowding(ry, min_sep_factor=1.25)
+
+    # Build response
+    results = [{"x": int(x), "y": int(y), "r": int(r), "label": c} for x, y, r, c in ry]
+    return {"success": True, "detections": results, "w": int(W0), "h": int(H0)}
 
 if __name__ == "__main__":
-    # Local dev entrypoint; Render will use the Procfile command
+    # Local dev entrypoint; Render uses your Procfile
     uvicorn.run(app, host="0.0.0.0", port=PORT)
