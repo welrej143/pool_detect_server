@@ -29,9 +29,8 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.3.1"}
+    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.3.2"}
 
-# Some platforms send HEAD probes; avoid 405 noise.
 @app.head("/")
 def root_head():
     return {}
@@ -109,7 +108,6 @@ def run_hough(gray, mask, r_est, param2, blur_ksize=9, dp=1.2):
             out.append((int(x), int(y), int(r), None))
     return out
 
-# color bins for proposals
 COLOR_BINS = [
     ("red",     [(0, 10), (170, 179)], 90,  80),
     ("orange",  [(11, 25)],            90,  90),
@@ -182,9 +180,7 @@ def _white_mask_ycc(bgr):
     return cv2.bitwise_and(m1, cv2.bitwise_and(m2, m3))
 
 def is_cue_ball(bgr_full, hsv_full, x, y, r):
-    # strong but simple thresholds
     ring = _ring_mask(bgr_full.shape[:2], x, y, r, 0.25, 0.90)
-
     wm = cv2.bitwise_and(_white_mask_ycc(bgr_full), ring)
     ring_area = max(1, cv2.countNonZero(ring))
     white_frac = cv2.countNonZero(wm) / ring_area
@@ -204,18 +200,42 @@ def is_cue_ball(bgr_full, hsv_full, x, y, r):
     return (white_frac >= 0.45 and s_med <= 55 and v_med >= 160) or \
            (white_frac >= 0.60 and chroma <= 26)
 
+# 👉 UPDATED: more permissive yellow; LAB fallback
 def classify_color_hsv(hsv_full, x, y, r):
     ring = _ring_mask(hsv_full.shape[:2], x, y, r, 0.35, 0.85)
     H, S, V = cv2.split(hsv_full)
+
+    # general colored mask
     hs = S[ring > 0]; hv = V[ring > 0]; hh = H[ring > 0]
-    mask_col = (hs > 60) & (hv > 70)
-    colored_h = hh[mask_col]
-    if colored_h.size == 0:
+    # allow lower saturation for yellow
+    mask_col_yellow = (hs > 40) & (hv > 90)
+    mask_col_other  = (hs > 60) & (hv > 70)
+
+    # try to find red/yellow directly
+    hvals_y = hh[mask_col_yellow]
+    hvals_o = hh[mask_col_other]
+
+    def median_if_any(arr):
+        return int(np.median(arr)) if arr.size else None
+
+    h_med_y = median_if_any(hvals_y)
+    h_med_o = median_if_any(hvals_o)
+
+    # Prefer the yellow-friendly estimate if it exists
+    h_med = h_med_y if h_med_y is not None else h_med_o
+    if h_med is None:
+        # LAB fallback for yellow
+        lab = cv2.cvtColor(hsv_full, cv2.COLOR_HSV2BGR)
+        lab = cv2.cvtColor(lab, cv2.COLOR_BGR2LAB)
+        b_vals = lab[..., 2][ring > 0]
+        if b_vals.size and float(np.median(b_vals)) >= 150:
+            return "yellow"
         return "unknown"
-    h_med = int(np.median(colored_h))
+
     if (0 <= h_med <= 10) or (170 <= h_med <= 179):
         return "red"
-    if 26 <= h_med <= 40:
+    # broadened yellow window
+    if 20 <= h_med <= 55:
         return "yellow"
     if 11 <= h_med <= 25:
         return "orange"
@@ -242,7 +262,7 @@ def is_stripe_ball(bgr_full, x, y, r, inner_frac=0.45, white_thr=0.18, white_vs_
 
     return (inner_white_frac >= white_thr) and (inner_white_frac + white_vs_color_bias >= colored_bias)
 
-# ---------- scoring + color-aware NMS (used for objects only) ----------
+# ---------- scoring + color-aware NMS ----------
 def _ring(gray_full, x, y, r):
     return _ring_mask(gray_full.shape[:2], x, y, r, 0.35, 0.90)
 
@@ -256,14 +276,23 @@ def _edge_strength_on_ring(gray_full, x, y, r):
         return 0.0
     return float(np.percentile(vals, 75))
 
+# 👉 UPDATED: color confidence uses yellow-friendly SV mask
 def _color_confidence(hsv_full, label, x, y, r):
-    ring_mask = _ring(hsv_full[..., 0], x, y, r)  # 2D mask
+    ring_mask = _ring(hsv_full[..., 0], x, y, r)
     H, S, V = cv2.split(hsv_full)
     hh = H[ring_mask > 0]; ss = S[ring_mask > 0]; vv = V[ring_mask > 0]
     if hh.size == 0:
         return 0.0
 
-    mask_col = (ss > 60) & (vv > 70)
+    if label == "yellow":
+        mask_col = (ss > 40) & (vv > 90)
+        ranges = [(20, 55)]
+    elif label == "red":
+        mask_col = (ss > 60) & (vv > 70)
+        ranges = [(0, 10), (170, 179)]
+    else:
+        return 0.0
+
     if not np.any(mask_col):
         return 0.0
     h = hh[mask_col]
@@ -277,16 +306,8 @@ def _color_confidence(hsv_full, label, x, y, r):
             dmin = np.minimum(dmin, d.astype(np.float32))
         return dmin
 
-    if label == "red":
-        ranges = [(0, 10), (170, 179)]
-    elif label == "yellow":
-        ranges = [(26, 40)]
-    else:
-        return 0.0
-
     d = hue_dist_to_range(h.astype(np.float32), ranges)
     conf = 1.0 - np.clip(np.median(d) / 40.0, 0.0, 1.0)
-    # ✅ FIX: don't re-index with the 2D ring mask; ss is already 1-D
     sat_boost = float(np.mean(ss > 100)) * 0.15
     return float(np.clip(conf + sat_boost, 0.0, 1.0))
 
@@ -412,17 +433,10 @@ async def detect_balls(file: UploadFile = File(...)):
 
 @app.post("/annotate")
 async def annotate_balls(file: UploadFile = File(...)):
-    """
-    Returns a PNG with color-coded outlines (no text labels):
-      - cue    = white outline
-      - solid  = green outline
-      - stripe = blue outline
-    """
     contents = await file.read()
     try:
         image_pil = ImageOps.exif_transpose(Image.open(BytesIO(contents))).convert("RGB")
     except UnidentifiedImageError:
-        # Return a tiny blank PNG for robustness
         blank = Image.new("RGB", (2, 2), (0, 0, 0))
         buf = BytesIO(); blank.save(buf, format="PNG"); buf.seek(0)
         return StreamingResponse(buf, media_type="image/png")
@@ -435,7 +449,7 @@ async def annotate_balls(file: UploadFile = File(...)):
         if d.get("kind") == "cue":
             color = (255, 255, 255)   # white
         else:
-            color = (255, 0, 0) if d.get("pattern") == "stripe" else (0, 255, 0)  # blue/green in BGR
+            color = (255, 0, 0) if d.get("pattern") == "stripe" else (0, 255, 0)
         thickness = max(2, r // 10)
         cv2.circle(bgr_full, (x, y), r, color, thickness)
         cv2.circle(bgr_full, (x, y), max(2, r // 14), color, -1)
