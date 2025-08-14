@@ -1,11 +1,13 @@
-# server.py — red/yellow labels with strong cue guard (keeps your original pipeline)
+# server.py — red/yellow labels with strong cue guard + score-aware de-crowding + optional overlay
 import os
 from io import BytesIO
+from collections import defaultdict
 
 import numpy as np
 import cv2
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 import uvicorn
 
@@ -24,7 +26,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.0.1"}
+    return {"ok": True, "service": "cuezen-ball-detect", "version": "1.2.0"}
 
 @app.get("/healthz")
 def health():
@@ -38,7 +40,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- helpers (same as before unless noted) ----------
+# ---------- helpers ----------
 def pil_to_cv2(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -99,7 +101,7 @@ def run_hough(gray, mask, r_est, param2, blur_ksize=9, dp=1.2):
             out.append((int(x), int(y), int(r), None))
     return out
 
-# color bins for proposals (unchanged)
+# color bins for proposals
 COLOR_BINS = [
     ("red",     [(0, 10), (170, 179)], 90,  80),
     ("orange",  [(11, 25)],            90,  90),
@@ -148,7 +150,7 @@ def color_mask_passes(hsv, base_mask, r_est):
         cand += _circles_from_binary(cmask, name, r_est)
     return cand
 
-# ---------- NEW: stronger cue guard + color classification ----------
+# ---------- cue guard + color/stripe ----------
 def _ring_mask(shape_hw, x, y, r, r_in=0.35, r_out=0.85):
     h, w = shape_hw
     outer = np.zeros((h, w), np.uint8)
@@ -157,8 +159,13 @@ def _ring_mask(shape_hw, x, y, r, r_in=0.35, r_out=0.85):
     cv2.circle(inner, (x, y), max(1, int(r * r_in)), 255, -1)
     return cv2.subtract(outer, inner)
 
+def _disk_mask(shape_hw, x, y, r, frac=0.45):
+    h, w = shape_hw
+    m = np.zeros((h, w), np.uint8)
+    cv2.circle(m, (x, y), max(1, int(r * frac)), 255, -1)
+    return m
+
 def _white_mask_ycc(bgr):
-    # bright & low chroma in YCrCb -> robust "white"
     ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     Y, Cr, Cb = cv2.split(ycc)
     m1 = cv2.inRange(Y, 165, 255)
@@ -167,46 +174,34 @@ def _white_mask_ycc(bgr):
     return cv2.bitwise_and(m1, cv2.bitwise_and(m2, m3))
 
 def is_cue_ball(bgr_full, hsv_full, x, y, r):
-    """Return True if this circle is very likely the cue ball."""
     ring = _ring_mask(bgr_full.shape[:2], x, y, r, 0.25, 0.90)
-
-    # 1) YCrCb white fraction (lighting tolerant)
     wm = cv2.bitwise_and(_white_mask_ycc(bgr_full), ring)
     ring_area = max(1, cv2.countNonZero(ring))
     white_frac = cv2.countNonZero(wm) / ring_area
 
-    # 2) Low saturation + high value bias (HSV)
-    hsv = hsv_full
-    S, V = hsv[..., 1], hsv[..., 2]
-    s_vals = S[ring > 0]
-    v_vals = V[ring > 0]
+    S = hsv_full[..., 1]; V = hsv_full[..., 2]
+    s_vals = S[ring > 0]; v_vals = V[ring > 0]
     s_med = float(np.median(s_vals)) if s_vals.size else 255
     v_med = float(np.median(v_vals)) if v_vals.size else 0
 
-    # 3) LAB chroma neutrality (helps against yellow cast)
     lab = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2LAB)
-    a_vals = lab[..., 1][ring > 0]
-    b_vals = lab[..., 2][ring > 0]
+    a_vals = lab[..., 1][ring > 0]; b_vals = lab[..., 2][ring > 0]
     if a_vals.size and b_vals.size:
         chroma = abs(float(np.median(a_vals)) - 128.0) + abs(float(np.median(b_vals)) - 128.0)
     else:
         chroma = 999.0
 
-    # Strong cue decision: enough white + low saturation + neutral chroma
     return (white_frac >= 0.45 and s_med <= 55 and v_med >= 160) or \
            (white_frac >= 0.60 and chroma <= 26)
 
 def classify_color_hsv(hsv_full, x, y, r):
-    """Hue-based color class for *non-cue* balls."""
     ring = _ring_mask(hsv_full.shape[:2], x, y, r, 0.35, 0.85)
     H, S, V = cv2.split(hsv_full)
-
     hs = S[ring > 0]; hv = V[ring > 0]; hh = H[ring > 0]
     mask_col = (hs > 60) & (hv > 70)
     colored_h = hh[mask_col]
     if colored_h.size == 0:
         return "unknown"
-
     h_med = int(np.median(colored_h))
     if (0 <= h_med <= 10) or (170 <= h_med <= 179):
         return "red"
@@ -222,23 +217,147 @@ def classify_color_hsv(hsv_full, x, y, r):
         return "purple"
     return "unknown"
 
-def less_crowded(dets, min_dist_factor=1.25):
-    out = []
-    for c in sorted(dets, key=lambda d: d["r"], reverse=True):
-        if not any(
-            ((c["x"] - o["x"]) ** 2 + (c["y"] - o["y"]) ** 2) ** 0.5
-            < min_dist_factor * min(c["r"], o["r"])
-            for o in out
-        ):
-            out.append(c)
-    return out
+def is_stripe_ball(bgr_full, x, y, r, inner_frac=0.45, white_thr=0.18, white_vs_color_bias=0.08):
+    disk = _disk_mask(bgr_full.shape[:2], x, y, r, inner_frac)
+    ring = _ring_mask(bgr_full.shape[:2], x, y, r, 0.45, 0.90)
+    wm = _white_mask_ycc(bgr_full)
+    inner_white = cv2.countNonZero(cv2.bitwise_and(wm, disk))
+    inner_area = max(1, cv2.countNonZero(disk))
+    inner_white_frac = inner_white / inner_area
 
-# ---------- endpoint ----------
-@app.post("/detect")
-async def detect_balls(file: UploadFile = File(...)):
-    contents = await file.read()
-    image_pil = ImageOps.exif_transpose(Image.open(BytesIO(contents))).convert("RGB")
-    bgr_full = pil_to_cv2(image_pil)
+    hsv_full = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2HSV)
+    S = hsv_full[..., 1]
+    ring_sat = S[ring > 0]
+    colored_bias = float(np.mean(ring_sat > 80)) if ring_sat.size else 0.0
+
+    return (inner_white_frac >= white_thr) and (inner_white_frac + white_vs_color_bias >= colored_bias)
+
+# ---------- >>> NEW: scoring + color-aware NMS for "less crowded" ----------
+def _edge_strength_on_ring(gray_full, x, y, r):
+    """Crisp edges on the ring imply a truer circle."""
+    ring = _ring_mask(gray_full.shape[:2], x, y, r, 0.35, 0.90)
+    # gradient magnitude via Sobel
+    gx = cv2.Sobel(gray_full, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_full, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    vals = mag[ring > 0]
+    if vals.size == 0:
+        return 0.0
+    return float(np.percentile(vals, 75))  # robust to noise
+
+def _color_confidence(hsv_full, label, x, y, r):
+    """Distance to the target hue band + saturation support."""
+    ring = _ring_mask(hsv_full.shape[:2], x, y, r, 0.35, 0.85)
+    H, S, V = cv2.split(hsv_full)
+    hh = H[ring > 0]; ss = S[ring > 0]; vv = V[ring > 0]
+    if hh.size == 0:
+        return 0.0
+
+    mask_col = (ss > 60) & (vv > 70)
+    if not np.any(mask_col):
+        return 0.0
+    h = hh[mask_col]
+
+    def hue_dist_to_range(hvals, ranges):
+        # circular hue distance to nearest range
+        dmin = np.inf * np.ones_like(hvals, dtype=np.float32)
+        for lo, hi in ranges:
+            # distance inside the band is 0
+            d = np.where((hvals >= lo) & (hvals <= hi), 0.0,
+                         np.minimum(np.abs(hvals - lo), np.abs(hvals - hi)))
+            # also consider wrap-around across 0/179 for red
+            d = np.minimum(d, np.minimum(np.abs(hvals + 180 - lo), np.abs(hvals - 180 - hi)))
+            dmin = np.minimum(dmin, d.astype(np.float32))
+        return dmin
+
+    if label == "red":
+        ranges = [(0,10),(170,179)]
+    elif label == "yellow":
+        ranges = [(26,40)]
+    else:
+        return 0.0
+
+    d = hue_dist_to_range(h.astype(np.float32), ranges)
+    # map distance (0..~40) to confidence (1..0)
+    conf = 1.0 - np.clip(np.median(d) / 40.0, 0.0, 1.0)
+    # boost if a good portion is strongly saturated
+    sat_boost = float(np.mean(ss[ring > 0] > 100)) * 0.15
+    return float(np.clip(conf + sat_boost, 0.0, 1.0))
+
+def _score_detection(bgr_full, hsv_full, gray_full, d):
+    x, y, r = d["x"], d["y"], d["r"]
+    lbl = d["label"]
+    # edge & color confidences in [0..1] roughly
+    edge = _edge_strength_on_ring(gray_full, x, y, r)
+    # normalize edge by image-wide percentile for stability
+    e_ref = max(1e-6, np.percentile(gray_full, 95))
+    edge_norm = float(np.clip(edge / e_ref, 0.0, 1.5))
+    col_conf = _color_confidence(hsv_full, lbl, x, y, r)
+    # prefer mid-range radii to avoid tiny/huge false circles
+    rnorm = np.clip(r / max(1.0, 0.5 * (bgr_full.shape[0] + bgr_full.shape[1]) / 90.0), 0.4, 1.6)
+    size_prior = 1.0 - float(abs(rnorm - 1.0)) * 0.35
+
+    # weighted score
+    score = 0.55 * col_conf + 0.35 * edge_norm + 0.10 * size_prior
+    return float(score)
+
+def _less_crowded_smart(bgr_full, dets, color_supp_mult=1.35, cross_color_mult=1.05, base_mult=1.15,
+                        grid_cap=3, grid_px=90):
+    """
+    Greedy score-aware NMS:
+      - Sort by score desc.
+      - Suppress neighbors within (mult * min(r_i, r_j)):
+          * stronger suppression for same-color neighbors (color_supp_mult)
+          * lighter for cross-color (cross_color_mult)
+          * base multiplier (base_mult)
+      - Optional coarse grid budget to avoid dense clusters dominating.
+    """
+    if not dets:
+        return dets
+
+    H, W = bgr_full.shape[:2]
+    gray = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2HSV)
+
+    # score each detection
+    for d in dets:
+        d["score"] = _score_detection(bgr_full, hsv, gray, d)
+
+    keep = []
+    occupied = defaultdict(int)
+
+    # grid helper
+    def cell_of(x, y):
+        return (int(x // grid_px), int(y // grid_px))
+
+    # greedy
+    for d in sorted(dets, key=lambda z: z["score"], reverse=True):
+        x, y, r, lbl = d["x"], d["y"], d["r"], d["label"]
+
+        # grid cap (limits very dense clusters)
+        cx, cy = cell_of(x, y)
+        if occupied[(cx, cy)] >= grid_cap:
+            continue
+
+        ok = True
+        for k in keep:
+            dx = x - k["x"]; dy = y - k["y"]
+            dist = (dx*dx + dy*dy) ** 0.5
+            mult = color_supp_mult if (lbl == k["label"]) else cross_color_mult
+            thr = mult * base_mult * min(r, k["r"])
+            if dist < thr:
+                ok = False
+                break
+
+        if ok:
+            keep.append(d)
+            occupied[(cx, cy)] += 1
+
+    return keep
+# ---------- <<< NEW end ----------
+
+# ---------- core detect (shared by both endpoints) ----------
+def _detect_core(bgr_full):
     H0, W0 = bgr_full.shape[:2]
 
     # downscale for speed; original for final coords/colors
@@ -258,7 +377,7 @@ async def detect_balls(file: UploadFile = File(...)):
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     r_est = estimate_radius(mask_felt, bgr.shape[1])
 
-    # Hough proposals (unchanged)
+    # Hough proposals
     proposals = []
     for p2, blur, dp, use_mask in [
         (30, 9, 1.2, True),
@@ -268,7 +387,7 @@ async def detect_balls(file: UploadFile = File(...)):
     ]:
         proposals += run_hough(gray, mask_felt if use_mask else None, r_est, p2, blur, dp)
 
-    # Color-based proposals (unchanged)
+    # Color-based proposals
     proposals += color_mask_passes(hsv, mask_felt, r_est)
 
     # Merge
@@ -282,21 +401,68 @@ async def detect_balls(file: UploadFile = File(...)):
             x, y, r = int(x / scale), int(y / scale), int(r / scale)
 
         # ignore circles touching edges
-        if x < r or y < r or x > (W0 - r) or y > (H0 - r):
+        if x < r or y < r or x > (bgr_full.shape[1] - r) or y > (bgr_full.shape[0] - r):
             continue
 
-        # cue guard first — if True, skip entirely
         if is_cue_ball(bgr_full, hsv_full, x, y, r):
             continue
 
         col = classify_color_hsv(hsv_full, x, y, r)
         if col in ("red", "yellow"):
-            prelim.append({"x": x, "y": y, "r": r, "label": col})
+            stripe = is_stripe_ball(bgr_full, x, y, r)
+            prelim.append({"x": x, "y": y, "r": r, "label": col, "pattern": "stripe" if stripe else "solid"})
 
-    detections = less_crowded(prelim, min_dist_factor=1.25)
+    # >>> NEW: apply smarter less-crowded filter
+    detections = _less_crowded_smart(
+        bgr_full,
+        prelim,
+        color_supp_mult=1.45,   # more aggressive for same-color neighbors
+        cross_color_mult=1.10,  # keep nearby opposite colors more often
+        base_mult=1.10,
+        grid_cap=3,             # at most 3 balls per ~90px cell
+        grid_px=max(70, int(1.5 * np.median([d["r"] for d in prelim])) if prelim else 90)
+    )
 
+    return detections, (bgr_full.shape[1], bgr_full.shape[0])
+
+# ---------- endpoints ----------
+@app.post("/detect")
+async def detect_balls(file: UploadFile = File(...)):
+    contents = await file.read()
+    image_pil = ImageOps.exif_transpose(Image.open(BytesIO(contents))).convert("RGB")
+    bgr_full = pil_to_cv2(image_pil)
+
+    detections, (W0, H0) = _detect_core(bgr_full)
     return {"success": True, "detections": detections, "w": W0, "h": H0}
 
+@app.post("/annotate")
+async def annotate_balls(file: UploadFile = File(...)):
+    """
+    Returns a PNG with color-coded outlines (no text labels):
+      - solid  = green outline
+      - stripe = blue outline
+    (Cue balls are suppressed by guard.)
+    """
+    contents = await file.read()
+    image_pil = ImageOps.exif_transpose(Image.open(BytesIO(contents))).convert("RGB")
+    bgr_full = pil_to_cv2(image_pil).copy()
+
+    detections, _ = _detect_core(bgr_full)
+
+    for d in detections:
+        x, y, r = d["x"], d["y"], d["r"]
+        is_stripe = (d.get("pattern") == "stripe")
+        color = (0, 255, 0) if not is_stripe else (255, 0, 0)  # BGR: green or blue
+        thickness = max(2, r // 10)
+        cv2.circle(bgr_full, (x, y), r, color, thickness)
+        cv2.circle(bgr_full, (x, y), max(2, r // 14), color, -1)
+
+    rgb = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2RGB)
+    pil_out = Image.fromarray(rgb)
+    buf = BytesIO()
+    pil_out.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
 if __name__ == "__main__":
-    # Local dev entrypoint; Render uses the Procfile command
     uvicorn.run(app, host="0.0.0.0", port=PORT)
