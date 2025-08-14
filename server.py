@@ -1,4 +1,4 @@
-# server.py — keep original pipeline; add (1) red/yellow-only filter, (2) less-crowded pass
+# server.py — original pipeline + (1) robust red/yellow, (2) less-crowded labels
 import os
 from io import BytesIO
 
@@ -39,7 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- helpers (UNCHANGED) ----------
+# ---------- helpers (ORIGINAL) ----------
 def pil_to_cv2(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -129,13 +129,13 @@ def _circles_from_binary(bin_mask, label, r_est):
 
 def color_mask_passes(hsv, base_mask, r_est):
     cand = []
-    # cue (very white) — we still *propose* it, but we'll drop it later when we keep only red/yellow
+    # cue (very white) — proposed but later filtered when we keep only red/yellow
     cue = cv2.inRange(hsv, np.array([0, 0, 210]), np.array([179, 55, 255]))
     if base_mask is not None:
         cue = cv2.bitwise_and(cue, base_mask)
     cand += _circles_from_binary(cue, "cue", r_est)
 
-    # black — same, proposed but can be filtered later
+    # black — proposed but can be filtered later
     black = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([179, 255, 55]))
     if base_mask is not None:
         black = cv2.bitwise_and(black, base_mask)
@@ -151,11 +151,12 @@ def color_mask_passes(hsv, base_mask, r_est):
         cand += _circles_from_binary(cmask, name, r_est)
     return cand
 
-# --- small helpers we are ADDING (new) ---
+# ---------- NEW: robust color classification + less-crowded filter ----------
 def classify_color_hsv(hsv_full, x, y, r):
     """
-    Classify circle by dominant hue around its mid-annulus (avoid specular highlights).
-    Returns one of: 'red','yellow','orange','green','blue','purple','black','cue','unknown'
+    Classify circle by dominant hue around its mid-annulus (avoid highlights).
+    Returns: 'red','yellow','green','blue','purple','black','cue','unknown'
+    (We purposely don't return 'orange' for English 8-ball.)
     """
     h, w = hsv_full.shape[:2]
     mask_outer = np.zeros((h, w), np.uint8)
@@ -165,53 +166,55 @@ def classify_color_hsv(hsv_full, x, y, r):
     ring = cv2.subtract(mask_outer, mask_inner)
 
     H, S, V = cv2.split(hsv_full)
-    # basic "white" and "black" quick checks
-    white_mask = cv2.inRange(hsv_full, np.array([0, 0, 205]), np.array([179, 60, 255]))
-    black_mask = cv2.inRange(hsv_full, np.array([0, 0, 0]), np.array([179, 255, 50]))
-    white_ratio = cv2.countNonZero(cv2.bitwise_and(white_mask, ring)) / max(1, cv2.countNonZero(ring))
-    black_ratio = cv2.countNonZero(cv2.bitwise_and(black_mask, ring)) / max(1, cv2.countNonZero(ring))
 
-    if white_ratio > 0.65:
+    # quick white/black checks
+    white_mask = cv2.inRange(hsv_full, np.array([0, 0, 205]), np.array([179, 70, 255]))
+    black_mask = cv2.inRange(hsv_full, np.array([0, 0, 0]),  np.array([179, 255, 55]))
+    denom = max(1, cv2.countNonZero(ring))
+    if cv2.countNonZero(cv2.bitwise_and(white_mask, ring)) / denom > 0.65:
         return "cue"
-    if black_ratio > 0.50:
+    if cv2.countNonZero(cv2.bitwise_and(black_mask, ring)) / denom > 0.50:
         return "black"
 
-    # histogram over hue for colored balls
-    hs = cv2.bitwise_and(S, ring)
-    hv = cv2.bitwise_and(V, ring)
-    colored = np.where((hs > 60) & (hv > 70), H, 255)  # 255 = ignore
-    valid = colored[colored != 255]
-    if valid.size == 0:
+    # use only reasonably saturated+bright pixels
+    sat = cv2.bitwise_and(S, ring)
+    val = cv2.bitwise_and(V, ring)
+    valid_mask = (sat > 55) & (val > 75)   # relaxed to catch warm yellows
+    valid_h = H[valid_mask]
+    if valid_h.size == 0:
         return "unknown"
 
-    mean_h = int(np.median(valid))  # robust central hue
-    # map to our bins
+    mean_h = int(np.median(valid_h))  # robust central hue
+
+    # map to bins (OpenCV hue 0..179)
     if (0 <= mean_h <= 10) or (170 <= mean_h <= 179):
         return "red"
-    if 11 <= mean_h <= 25:
-        return "orange"
-    if 26 <= mean_h <= 40:
+    # WIDEN YELLOW to include warm/orange-ish yellows
+    if 18 <= mean_h <= 50:
         return "yellow"
-    if 41 <= mean_h <= 85:
+    if 51 <= mean_h <= 85:
         return "green"
     if 86 <= mean_h <= 130:
         return "blue"
     if 131 <= mean_h <= 160:
         return "purple"
-    return "unknown"
+    # Anything near "orange" we also treat as yellow for English 8-ball
+    return "yellow"
 
 def less_crowded(dets, min_dist_factor=1.25):
-    """Second-stage spacing filter to reduce label crowding (keep larger radius first)."""
+    """Second-stage spacing filter to reduce label crowding (keeps larger radius first)."""
     out = []
     for c in sorted(dets, key=lambda d: d["r"], reverse=True):
-        if not any(
-            ( (c["x"]-o["x"])**2 + (c["y"]-o["y"])**2 )**0.5 < min_dist_factor * min(c["r"], o["r"])
+        too_close = any(
+            ((c["x"] - o["x"])**2 + (c["y"] - o["y"])**2) ** 0.5
+            < min_dist_factor * min(c["r"], o["r"])
             for o in out
-        ):
+        )
+        if not too_close:
             out.append(c)
     return out
 
-# ---------- endpoint (UNCHANGED detection; only post-filter ADDED) ----------
+# ---------- endpoint (ORIGINAL pipeline + small post-filter) ----------
 @app.post("/detect")
 async def detect_balls(file: UploadFile = File(...)):
     contents = await file.read()
@@ -247,7 +250,8 @@ async def detect_balls(file: UploadFile = File(...)):
     proposals += color_mask_passes(hsv, mask_felt, r_est)
     merged = dedupe(proposals, thr=0.6)
 
-    # --- NEW: color classification on ORIGINAL SCALE, then keep only red/yellow, then less-crowded
+    # Color classification on ORIGINAL scale, keep only red/yellow for this view,
+    # then apply less-crowded filter for cleaner labels.
     hsv_full = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2HSV)
     prelim = []
     for x, y, r, _lbl in merged:
@@ -259,15 +263,17 @@ async def detect_balls(file: UploadFile = File(...)):
             continue
 
         col = classify_color_hsv(hsv_full, x, y, r)
+        # English 8-ball: treat orange-like hues as yellow
+        if col == "orange":
+            col = "yellow"
+
         if col in ("red", "yellow"):
             prelim.append({"x": x, "y": y, "r": r, "label": col})
-        # explicitly ignore "black" and other colors here
 
-    # reduce crowded labels
     detections = less_crowded(prelim, min_dist_factor=1.25)
 
     return {"success": True, "detections": detections, "w": W0, "h": H0}
 
 if __name__ == "__main__":
-    # Local dev entrypoint; Render uses Procfile
+    # Local dev entrypoint; Render will use Procfile command (uvicorn server:app --host 0.0.0.0 --port $PORT)
     uvicorn.run(app, host="0.0.0.0", port=PORT)
